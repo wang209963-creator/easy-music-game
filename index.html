@@ -6,6 +6,7 @@
     <title>4K 大間隔音遊 - 專業選歌與連擊分版</title>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.4.120/pdf.min.js"></script>
     <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js"></script>
     
     <style>
         * {
@@ -2286,7 +2287,7 @@
             return new Blob([new Uint8Array(byteNumbers)], { type: mimeType || "application/octet-stream" });
         }
 
-        // ====== 🎵 音軌擷取：上傳影片檔時，只取出音訊並重新編碼成 WAV，捨棄畫面資料 ======
+        // ====== 🎵 音軌擷取：上傳影片檔時，只取出音訊並重新編碼成 MP3，捨棄畫面資料 ======
         function isVideoContainerFile(file) {
             if (!file) return false;
             if (file.type && file.type.startsWith('video/')) return true;
@@ -2343,10 +2344,53 @@
             return new Blob([arrBuf], { type: 'audio/wav' });
         }
 
+        // 把 Float32 PCM 樣本轉成 16-bit 整數樣本（lamejs 編碼器吃 Int16Array）
+        function floatTo16BitIntArray(floatArr) {
+            const int16 = new Int16Array(floatArr.length);
+            for (let i = 0; i < floatArr.length; i++) {
+                const s = Math.max(-1, Math.min(1, floatArr[i]));
+                int16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+            }
+            return int16;
+        }
+
+        // 把解碼後的 AudioBuffer 用 lamejs 編碼成 MP3 Blob（有損壓縮，體積遠小於 WAV）
+        function audioBufferToMp3Blob(buffer, kbps = 128) {
+            const numChannels = Math.min(buffer.numberOfChannels, 2);
+            const sampleRate = buffer.sampleRate;
+            const mp3encoder = new lamejs.Mp3Encoder(numChannels, sampleRate, kbps);
+            const sampleBlockSize = 1152; // lamejs 建議值，需為 576 的倍數
+            const mp3Chunks = [];
+
+            if (numChannels === 2) {
+                const left = floatTo16BitIntArray(buffer.getChannelData(0));
+                const right = floatTo16BitIntArray(buffer.getChannelData(1));
+                for (let i = 0; i < left.length; i += sampleBlockSize) {
+                    const leftChunk = left.subarray(i, i + sampleBlockSize);
+                    const rightChunk = right.subarray(i, i + sampleBlockSize);
+                    const mp3buf = mp3encoder.encodeBuffer(leftChunk, rightChunk);
+                    if (mp3buf.length > 0) mp3Chunks.push(mp3buf);
+                }
+            } else {
+                const mono = floatTo16BitIntArray(buffer.getChannelData(0));
+                for (let i = 0; i < mono.length; i += sampleBlockSize) {
+                    const chunk = mono.subarray(i, i + sampleBlockSize);
+                    const mp3buf = mp3encoder.encodeBuffer(chunk);
+                    if (mp3buf.length > 0) mp3Chunks.push(mp3buf);
+                }
+            }
+
+            const finalBuf = mp3encoder.flush();
+            if (finalBuf.length > 0) mp3Chunks.push(finalBuf);
+
+            return new Blob(mp3Chunks, { type: 'audio/mpeg' });
+        }
+
         // 從使用者選取的檔案產生「音訊打包資料」（{base64, mimeType, fileName}）。
         // 一般音樂檔（mp3/wav/...）直接沿用原始位元組；若偵測到是影片容器（mp4/mov），
         // 則先用 Web Audio API 解碼出音軌（畫面資料在此步驟就會被自動捨棄），
-        // 再重新編碼成 WAV 存起來，讓打包出來的檔案不必再夾帶整支影片。
+        // 再用 lamejs 重新編碼成 MP3（128kbps）存起來，讓打包出來的檔案不必再夾帶整支影片，
+        // 也不會像未壓縮 WAV 那樣體積暴增。
         async function extractAudioPackageFromFile(file) {
             if (!isVideoContainerFile(file)) {
                 const base64 = await blobToBase64(file);
@@ -2356,10 +2400,10 @@
             if (audioContext.state === 'suspended') { await audioContext.resume(); }
             const arrBuf = await file.arrayBuffer();
             const decoded = await audioContext.decodeAudioData(arrBuf);
-            const wavBlob = audioBufferToWavBlob(decoded);
-            const base64 = await blobToBase64(wavBlob);
-            const newName = (file.name || 'audio').replace(/\.[^.]+$/, '') + '.wav';
-            return { base64, mimeType: 'audio/wav', fileName: newName };
+            const mp3Blob = audioBufferToMp3Blob(decoded, 128);
+            const base64 = await blobToBase64(mp3Blob);
+            const newName = (file.name || 'audio').replace(/\.[^.]+$/, '') + '.mp3';
+            return { base64, mimeType: 'audio/mpeg', fileName: newName };
         }
 
         function generateRandomPackageFileName(prefixLetters = 8) {
