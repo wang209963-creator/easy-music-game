@@ -1513,16 +1513,15 @@
 
                 let audioPkg = existing ? existing.record._audio_pkg : null;
                 if (audioFile) {
-                    // 新音訊：轉 base64
-                    audioPkg = await new Promise((resolve) => {
-                        const reader = new FileReader();
-                        reader.onload = () => resolve({
-                            base64: reader.result.split(',')[1] || '',
-                            mimeType: audioFile.type || 'audio/mpeg',
-                            fileName: audioFile.name
-                        });
-                        reader.readAsDataURL(audioFile);
-                    });
+                    // 新音訊：若為影片檔，先擷取音軌轉純音訊(WAV)再打包；一般音樂檔則直接轉 base64
+                    const saveBtnEl = document.getElementById('save-btn');
+                    const saveBtnOrigText = saveBtnEl.innerText;
+                    if (isVideoContainerFile(audioFile)) { saveBtnEl.disabled = true; saveBtnEl.innerText = '⏳ 擷取音軌中...'; }
+                    try {
+                        audioPkg = await extractAudioPackageFromFile(audioFile);
+                    } finally {
+                        saveBtnEl.disabled = false; saveBtnEl.innerText = saveBtnOrigText;
+                    }
                 }
 
                 if (!audioPkg) { alert('這是新歌曲，必須上傳音樂檔案！'); return; }
@@ -2220,15 +2219,8 @@
                 } else if (editModCurrentTarget === 'audio') {
                     const aFile = document.getElementById('editmod-audio-file').files[0];
                     if (!aFile) { alert('請選擇音樂檔案！'); saveBtn.disabled = false; saveBtn.innerText = '💾 儲存此項目'; return; }
-                    const audioPkg = await new Promise((resolve) => {
-                        const reader = new FileReader();
-                        reader.onload = () => resolve({
-                            base64: reader.result.split(',')[1] || '',
-                            mimeType: aFile.type || 'audio/mpeg',
-                            fileName: aFile.name
-                        });
-                        reader.readAsDataURL(aFile);
-                    });
+                    if (isVideoContainerFile(aFile)) { saveBtn.innerText = '⏳ 擷取音軌中...'; }
+                    const audioPkg = await extractAudioPackageFromFile(aFile);
                     record._audio_pkg = audioPkg;
                 }
 
@@ -2292,6 +2284,82 @@
             const byteNumbers = new Array(byteChars.length);
             for (let i = 0; i < byteChars.length; i++) byteNumbers[i] = byteChars.charCodeAt(i);
             return new Blob([new Uint8Array(byteNumbers)], { type: mimeType || "application/octet-stream" });
+        }
+
+        // ====== 🎵 音軌擷取：上傳影片檔時，只取出音訊並重新編碼成 WAV，捨棄畫面資料 ======
+        function isVideoContainerFile(file) {
+            if (!file) return false;
+            if (file.type && file.type.startsWith('video/')) return true;
+            return /\.(mp4|mov|m4v|qt)$/i.test(file.name || '');
+        }
+
+        function writeAsciiString(view, offset, str) {
+            for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+        }
+
+        function interleaveChannels(left, right) {
+            const length = left.length + right.length;
+            const result = new Float32Array(length);
+            let idx = 0, i = 0;
+            while (idx < length) { result[idx++] = left[i]; result[idx++] = right[i]; i++; }
+            return result;
+        }
+
+        function floatTo16BitPCM(view, offset, input) {
+            for (let i = 0; i < input.length; i++, offset += 2) {
+                const s = Math.max(-1, Math.min(1, input[i]));
+                view.setInt16(offset, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+            }
+        }
+
+        // 把解碼後的 AudioBuffer（純音訊 PCM 資料）打包成標準 16bit WAV Blob
+        function audioBufferToWavBlob(buffer) {
+            const numChannels = Math.min(buffer.numberOfChannels, 2);
+            const sampleRate = buffer.sampleRate;
+            const samples = numChannels === 2
+                ? interleaveChannels(buffer.getChannelData(0), buffer.getChannelData(1))
+                : buffer.getChannelData(0);
+
+            const bytesPerSample = 2;
+            const dataLength = samples.length * bytesPerSample;
+            const arrBuf = new ArrayBuffer(44 + dataLength);
+            const view = new DataView(arrBuf);
+
+            writeAsciiString(view, 0, 'RIFF');
+            view.setUint32(4, 36 + dataLength, true);
+            writeAsciiString(view, 8, 'WAVE');
+            writeAsciiString(view, 12, 'fmt ');
+            view.setUint32(16, 16, true);
+            view.setUint16(20, 1, true); // PCM
+            view.setUint16(22, numChannels, true);
+            view.setUint32(24, sampleRate, true);
+            view.setUint32(28, sampleRate * numChannels * bytesPerSample, true);
+            view.setUint16(32, numChannels * bytesPerSample, true);
+            view.setUint16(34, 16, true);
+            writeAsciiString(view, 36, 'data');
+            view.setUint32(40, dataLength, true);
+            floatTo16BitPCM(view, 44, samples);
+
+            return new Blob([arrBuf], { type: 'audio/wav' });
+        }
+
+        // 從使用者選取的檔案產生「音訊打包資料」（{base64, mimeType, fileName}）。
+        // 一般音樂檔（mp3/wav/...）直接沿用原始位元組；若偵測到是影片容器（mp4/mov），
+        // 則先用 Web Audio API 解碼出音軌（畫面資料在此步驟就會被自動捨棄），
+        // 再重新編碼成 WAV 存起來，讓打包出來的檔案不必再夾帶整支影片。
+        async function extractAudioPackageFromFile(file) {
+            if (!isVideoContainerFile(file)) {
+                const base64 = await blobToBase64(file);
+                return { base64, mimeType: file.type || 'audio/mpeg', fileName: file.name };
+            }
+            if (!audioContext) { audioContext = new (window.AudioContext || window.webkitAudioContext)(); }
+            if (audioContext.state === 'suspended') { await audioContext.resume(); }
+            const arrBuf = await file.arrayBuffer();
+            const decoded = await audioContext.decodeAudioData(arrBuf);
+            const wavBlob = audioBufferToWavBlob(decoded);
+            const base64 = await blobToBase64(wavBlob);
+            const newName = (file.name || 'audio').replace(/\.[^.]+$/, '') + '.wav';
+            return { base64, mimeType: 'audio/wav', fileName: newName };
         }
 
         function generateRandomPackageFileName(prefixLetters = 8) {
